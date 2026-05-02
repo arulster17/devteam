@@ -1,0 +1,29 @@
+{
+  "limits": {
+    "max_parallel_workers": 5,
+    "max_debug_iterations": 3,
+    "max_review_iterations": 3,
+    "max_total_passes": 10,
+    "github_poll_interval_seconds": 15,
+    "max_github_calls_per_run": 500
+  },
+  "checkpoints": {
+    "require_approval_after_spec": true,
+    "require_approval_after_architecture": true,
+    "require_approval_after_budget": true,
+    "warn_at_budget_percent": 90
+  },
+  "github": {
+    "repo": "owner/repo",
+    "integration_branch": "integration",
+    "main_branch": "main",
+    "protect_main": true
+  },
+  "stack": {
+    "language": "typescript",
+    "test_runner": "jest",
+    "linter": "eslint",
+    "formatter": "prettier",
+    "type_checker": "tsc"
+  }
+}

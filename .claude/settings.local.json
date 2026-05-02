@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_budget.py -v)",
+      "Bash(python -c \"from orchestrator import work_plan, agent, context, budget, checkpoint, git_ops, logger; print\\('core OK'\\)\")",
+      "Bash(python -c \"from orchestrator.main import main; print\\('main OK'\\)\")",
+      "Bash(python -c \"from orchestrator.github_client import GitHubClient; print\\('github_client OK'\\)\")",
+      "Bash(python -c \"from orchestrator.docker_runner import DockerRunner, extract_failures; print\\('docker_runner OK'\\)\")",
+      "Bash(pip install *)"
+    ]
+  }
+}
