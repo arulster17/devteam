@@ -7,10 +7,11 @@ read-only rootfs (project dir bind-mounted read-write at /workspace).
 """
 import json
 import re
+import tempfile
 from pathlib import Path
 
-import docker
-from docker.errors import ContainerError, ImageNotFound, APIError
+import docker  # type: ignore[import-not-found,attr-defined]
+from docker.errors import ContainerError, ImageNotFound, APIError  # type: ignore[import-not-found]
 
 from orchestrator.logger import log_event
 
@@ -26,32 +27,45 @@ def _load_stack() -> dict:
     return {}
 
 
-def _runner_image(stack: dict) -> str:
-    """Map language/test_runner to a Docker image tag."""
+def _runner_image(stack: dict) -> tuple[str, Path | None]:
+    """Map language/test_runner to (image_tag, dockerfile_path|None)."""
     language = stack.get("language", "typescript").lower()
     test_runner = stack.get("test_runner", "jest").lower()
-    images = {
-        ("typescript", "jest"): "node:20-alpine",
-        ("javascript", "jest"): "node:20-alpine",
-        ("python", "pytest"): "python:3.12-slim",
-        ("go", "go test"): "golang:1.22-alpine",
+    _NODE = ("devteam-node:latest", Path("docker/node.dockerfile"))
+    _PYTHON = ("devteam-python:latest", Path("docker/python.dockerfile"))
+    configs: dict[tuple[str, str], tuple[str, Path | None]] = {
+        ("typescript", "jest"): _NODE,
+        ("javascript", "jest"): _NODE,
+        ("javascript", "mocha"): _NODE,
+        ("typescript", "vitest"): _NODE,
+        ("python", "pytest"): _PYTHON,
+        ("go", "go test"): ("golang:1.22-alpine", None),
     }
-    return images.get((language, test_runner), "node:20-alpine")
+    return configs.get((language, test_runner), _NODE)
 
 
 class DockerRunner:
     def __init__(self, project_root: str | Path = ".") -> None:
-        self._client = docker.from_env()
+        self._client = docker.from_env()  # type: ignore[attr-defined]
         self._project_root = Path(project_root).resolve()
         self._stack = _load_stack()
-        self._image = _runner_image(self._stack)
+        self._image, self._dockerfile = _runner_image(self._stack)
 
     def _ensure_image(self) -> None:
         try:
             self._client.images.get(self._image)
         except ImageNotFound:
-            log_event("docker_pull", {"image": self._image})
-            self._client.images.pull(self._image)
+            if self._dockerfile is not None and self._dockerfile.exists():
+                log_event("docker_build", {"image": self._image, "dockerfile": str(self._dockerfile)})
+                self._client.images.build(
+                    path=str(self._project_root),
+                    dockerfile=str(self._dockerfile.resolve()),
+                    tag=self._image,
+                    rm=True,
+                )
+            else:
+                log_event("docker_pull", {"image": self._image})
+                self._client.images.pull(self._image)
 
     def run(
         self,
@@ -59,6 +73,8 @@ class DockerRunner:
         working_dir: str = "/workspace",
         timeout_seconds: int = 120,
         instance_id: str = "docker",
+        extra_volumes: dict | None = None,
+        environment: dict | None = None,
     ) -> dict:
         """
         Run `command` inside a sandboxed container.
@@ -81,17 +97,22 @@ class DockerRunner:
             "command": command if isinstance(command, str) else " ".join(command),
         })
 
+        volumes = {
+            str(self._project_root): {
+                "bind": "/workspace",
+                "mode": "rw",
+            }
+        }
+        if extra_volumes:
+            volumes.update(extra_volumes)
+
         try:
             container = self._client.containers.run(
                 image=self._image,
                 command=cmd,
                 working_dir=working_dir,
-                volumes={
-                    str(self._project_root): {
-                        "bind": "/workspace",
-                        "mode": "rw",
-                    }
-                },
+                volumes=volumes,
+                environment=environment or {},
                 network_disabled=True,
                 mem_limit=_MEM_LIMIT,
                 nano_cpus=_NANO_CPUS,
@@ -135,19 +156,45 @@ class DockerRunner:
     def run_tests(self, instance_id: str = "test_runner") -> dict:
         """
         Run the project's test suite using the configured test runner.
+
+        Mounts a write-only results volume at /results and injects RESULTS_PATH
+        so test runners can write structured JSON to /results/output.json.
+        Falls back to stdout parsing if the file is not produced.
+
         Returns the run result dict plus a parsed `failures` list.
         """
         test_runner = self._stack.get("test_runner", "jest")
         commands = {
-            "jest": "npx jest --no-coverage --forceExit 2>&1",
-            "pytest": "python -m pytest -v 2>&1",
+            "jest": 'npx jest --no-coverage --forceExit --json --outputFile="$RESULTS_PATH" 2>&1',
+            "pytest": 'python -m pytest -v --json-report --json-report-file="$RESULTS_PATH" 2>&1',
             "go test": "go test ./... 2>&1",
             "mocha": "npx mocha 2>&1",
             "vitest": "npx vitest run 2>&1",
         }
         cmd = commands.get(test_runner, f"{test_runner} 2>&1")
-        result = self.run(cmd, instance_id=instance_id)
-        result["failures"] = extract_failures(result["stdout"] + "\n" + result["stderr"], test_runner)
+
+        parsed_json: dict | None = None
+        with tempfile.TemporaryDirectory() as results_dir:
+            result = self.run(
+                cmd,
+                instance_id=instance_id,
+                extra_volumes={results_dir: {"bind": "/results", "mode": "rw"}},
+                environment={"RESULTS_PATH": "/results/output.json"},
+            )
+            results_file = Path(results_dir) / "output.json"
+            if results_file.exists():
+                try:
+                    parsed_json = json.loads(results_file.read_text())
+                except json.JSONDecodeError:
+                    pass
+
+        if parsed_json is not None:
+            normalized = _normalize_results_json(parsed_json, test_runner)
+            result["success"] = normalized["passed"]
+            result["failures"] = normalized["failures"]
+        else:
+            result["failures"] = extract_failures(result["stdout"] + "\n" + result["stderr"], test_runner)
+
         return result
 
     def run_linter(self, instance_id: str = "linter") -> dict:
@@ -172,6 +219,38 @@ class DockerRunner:
         return self.run(cmd, instance_id=instance_id)
 
 
+def _normalize_results_json(data: dict, test_runner: str) -> dict:
+    """Normalize runner-native JSON output to {passed: bool, failures: list[dict]}."""
+    if test_runner == "pytest":
+        # pytest-json-report: exitcode 0 = all passed
+        passed = data.get("exitcode", 1) == 0
+        failures = [
+            {
+                "test": t.get("nodeid", ""),
+                "message": str(t.get("call", {}).get("longrepr", ""))[:500],
+            }
+            for t in data.get("tests", [])
+            if t.get("outcome") == "failed"
+        ]
+        return {"passed": passed, "failures": failures}
+    elif test_runner in ("jest", "vitest", "mocha"):
+        # Jest --json: success field + nested testResults
+        num_failed = data.get("numFailedTests", -1)
+        passed = bool(data.get("success", num_failed == 0))
+        failures = []
+        for suite in data.get("testResults", []):
+            for test in suite.get("testResults", []):
+                if test.get("status") != "passed":
+                    msg = " ".join(test.get("failureMessages", []))
+                    failures.append({"test": test.get("fullName", ""), "message": msg[:500]})
+        return {"passed": passed, "failures": failures}
+    else:
+        return {
+            "passed": bool(data.get("passed", data.get("success", False))),
+            "failures": data.get("failures", []),
+        }
+
+
 def extract_failures(output: str, test_runner: str = "jest") -> list[dict]:
     """
     Parse test output and return a list of failure dicts.
@@ -193,7 +272,7 @@ def extract_failures(output: str, test_runner: str = "jest") -> list[dict]:
         # Extract failure blocks between ● markers
         blocks = suite_pattern.findall(output)
         # Also grab the "Expected / Received" lines from the output
-        error_lines = [l.strip() for l in output.splitlines() if l.strip().startswith("Expected") or l.strip().startswith("Received")]
+        error_lines = [line.strip() for line in output.splitlines() if line.strip().startswith("Expected") or line.strip().startswith("Received")]
         for i, block in enumerate(blocks):
             message = error_lines[i] if i < len(error_lines) else ""
             failures.append({"test": block.strip(), "message": message})

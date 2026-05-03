@@ -5,13 +5,14 @@ Bootstrap sequence:
   1. Load .env / config
   2. Write .gitignore (first run only)
   3. Set budget via budget_manager
-  4. top_level_agent conversation loop → work plan → execute
+  4. top_level_agent conversation loop → work plan → pass loop
 
 Resume: if run/checkpoint.json exists, skip straight to executing its work plan.
 """
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 
 from orchestrator import agent as agent_mod
 from orchestrator import budget as budget_mod
+from orchestrator import checkpoint as checkpoint_mod
 from orchestrator import git_ops
 from orchestrator import work_plan as work_plan_mod
 from orchestrator.logger import log_event
@@ -41,15 +43,19 @@ def _require_env(key: str) -> str:
     return val
 
 
-def _save_checkpoint(work_plan: dict) -> None:
+def _save_checkpoint(work_plan: dict, pass_num: int = 1) -> None:
     _CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _CHECKPOINT_PATH.write_text(json.dumps(work_plan, indent=2))
+    _CHECKPOINT_PATH.write_text(json.dumps({"work_plan": work_plan, "pass_num": pass_num}, indent=2))
 
 
-def _load_checkpoint() -> dict | None:
-    if _CHECKPOINT_PATH.exists():
-        return json.loads(_CHECKPOINT_PATH.read_text())
-    return None
+def _load_checkpoint() -> tuple[dict, int] | None:
+    if not _CHECKPOINT_PATH.exists():
+        return None
+    data = json.loads(_CHECKPOINT_PATH.read_text())
+    # Support old format (bare work plan dict) written before this change
+    if "work_plan" in data:
+        return data["work_plan"], data.get("pass_num", 1)
+    return data, 1
 
 
 def _clear_checkpoint() -> None:
@@ -94,7 +100,6 @@ async def _conversation_loop(config: dict) -> str:
     Returns the raw JSON work plan string.
     """
     model = "claude-opus-4-7"
-    messages: list[dict] = []
     budget_state = budget_mod.load()
 
     print("\nDescribe your project (or type 'quit' to exit):")
@@ -144,6 +149,238 @@ async def _conversation_loop(config: dict) -> str:
         context = {"inline": inline}
 
 
+# ── Text helpers for GitHub wiring ──────────────────────────────────────────
+
+def _extract_user_stories(text: str) -> list[str]:
+    """Parse ## User Stories section from a markdown spec. One item per bullet/heading."""
+    in_section = False
+    stories: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("## User Stories"):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section:
+            stripped = line.strip()
+            if stripped.startswith(("- ", "* ")):
+                stories.append(stripped[2:].strip())
+            elif stripped.startswith("### "):
+                stories.append(stripped[4:].strip())
+    return stories
+
+
+def _extract_modules(text: str) -> list[str]:
+    """
+    Parse module names from a markdown architecture doc.
+    Handles both '## Module Boundaries' (architect.md format) with '### name'
+    subsections, and a plain '## Modules' list with '- name' bullets.
+    """
+    in_section = False
+    modules: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("## Module Boundaries") or line.startswith("## Modules"):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section:
+            stripped = line.strip()
+            if stripped.startswith("### "):
+                modules.append(stripped[4:].strip())
+            elif stripped.startswith(("- ", "* ")):
+                modules.append(stripped[2:].strip())
+    return modules
+
+
+# ── GitHub wiring ────────────────────────────────────────────────────────────
+
+def _push_worker_result(gh: object, aid: str, result_text: str) -> None:
+    """Attempt to push a dev_worker's committed files to its module branch."""
+    try:
+        result = json.loads(result_text)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not result.get("files_written"):
+        return
+    # Extract module from instance_id using the documented convention:
+    # dev_worker_<module>_<n>  →  module/<module>
+    # e.g. dev_worker_auth_1  →  module/auth
+    m = re.match(r"^dev_worker_(.+)_\d+$", aid)
+    module = m.group(1) if m else "main"
+    branch = f"module/{module}"
+    commit_msg = result.get("commit_message", f"feat: {aid}")
+    try:
+        if not gh.branch_exists(branch):  # type: ignore[attr-defined]
+            gh.create_branch(branch)  # type: ignore[attr-defined]
+        git_ops.checkout(branch)
+        git_ops.commit_all(commit_msg)
+        git_ops.push(branch)
+    except Exception as exc:
+        log_event("github_push_error", {"aid": aid, "error": str(exc)})
+
+
+def _run_github_wiring(work_plan: dict, completed: dict, pass_num: int) -> None:
+    """
+    Post-pass GitHub operations. Entirely optional — if GITHUB_TOKEN is absent
+    or the repo is unreachable, logs a warning and continues without failing.
+    """
+    try:
+        from orchestrator.github_client import GitHubClient
+        gh = GitHubClient()
+    except Exception as exc:
+        log_event("github_skipped", {"reason": str(exc)})
+        return
+
+    actions_by_id = {
+        (a.get("instance_id") or a.get("name", "")): a
+        for a in work_plan.get("actions", [])
+    }
+    config = _load_config()
+
+    # spec_approval → milestone + one issue per user story
+    try:
+        if "spec_approval" in completed:
+            spec_path = Path("decisions/spec.md")
+            if spec_path.exists():
+                stories = _extract_user_stories(spec_path.read_text())
+                if stories:
+                    milestone_num = gh.create_milestone(f"Pass {pass_num}", "")
+                    for story in stories:
+                        gh.create_issue(title=story, body="", milestone_number=milestone_num)
+    except Exception as exc:
+        log_event("github_wiring_error", {"step": "spec_approval", "error": str(exc)})
+
+    # architecture_approval → one branch per module
+    try:
+        if "architecture_approval" in completed:
+            arch_path = Path("decisions/architecture.md")
+            if arch_path.exists():
+                for module in _extract_modules(arch_path.read_text()):
+                    branch = f"module/{module.lower()}"
+                    if not gh.branch_exists(branch):
+                        gh.create_branch(branch)
+    except Exception as exc:
+        log_event("github_wiring_error", {"step": "architecture_approval", "error": str(exc)})
+
+    # dev_worker completions → push to module branch
+    try:
+        for aid, action in actions_by_id.items():
+            if action.get("role") == "dev_worker" and aid in completed:
+                _push_worker_result(gh, aid, completed[aid])
+    except Exception as exc:
+        log_event("github_wiring_error", {"step": "dev_worker", "error": str(exc)})
+
+    # integrator → open integration → main PR
+    try:
+        integration_branch = config.get("github", {}).get("integration_branch", "integration")
+        main_branch = config.get("github", {}).get("main_branch", "main")
+        for aid, action in actions_by_id.items():
+            if action.get("role") == "integrator" and aid in completed:
+                if gh.branch_exists(integration_branch):
+                    pr_num = gh.create_pr(
+                        title=f"Integration pass {pass_num}",
+                        body=f"Automated integration PR for pass {pass_num}.",
+                        head=integration_branch,
+                        base=main_branch,
+                    )
+                    log_event("github_integration_pr", {"pr": pr_num, "pass": pass_num})
+                break
+    except Exception as exc:
+        log_event("github_wiring_error", {"step": "integrator", "error": str(exc)})
+
+
+# ── Pass loop ────────────────────────────────────────────────────────────────
+
+async def _pass_loop(work_plan: dict, config: dict, start_pass: int = 1) -> None:
+    """
+    Multi-pass execution loop. Each pass: execute work plan → commit/tag →
+    surface pass summary checkpoint → human decides continue/redirect/stop.
+    """
+    max_passes = config.get("limits", {}).get("max_total_passes", 10)
+
+    for pass_num in range(start_pass, max_passes + 1):
+        commit_hash = git_ops.current_commit_hash()
+        log_event("pass_start", {"pass": pass_num, "commit": commit_hash})
+        _save_checkpoint(work_plan, pass_num)
+
+        try:
+            completed = await work_plan_mod.execute(work_plan)
+        except BudgetHaltedError:
+            _save_checkpoint(work_plan, pass_num)
+            print(f"\nBudget halted on pass {pass_num}. Checkpoint saved.")
+            log_event("budget_halted", {"pass": pass_num})
+            return
+        except KeyboardInterrupt:
+            _save_checkpoint(work_plan, pass_num)
+            print("\nInterrupted. Checkpoint saved.")
+            return
+
+        log_event("pass_complete", {"pass": pass_num, "completed": len(completed)})
+
+        git_ops.commit_all(f"pass {pass_num}: {len(completed)} actions")
+        git_ops.tag(f"pass-{pass_num}", f"pass {pass_num}")
+
+        _run_github_wiring(work_plan, completed, pass_num)
+
+        summary_action = {
+            "action": "checkpoint",
+            "name": "pass_summary",
+            "summary": f"Pass {pass_num} complete. {len(completed)} actions executed.",
+            "key_decisions": list(completed.keys()),
+            "options": ["[A] Continue", "[B] Redirect", "[C] Stop"],
+        }
+        human_response = checkpoint_mod.surface(summary_action, completed)
+        log_event("pass_summary_response", {"pass": pass_num, "response": human_response})
+
+        choice = human_response.strip().upper()
+
+        if choice.startswith("C"):
+            summary = await agent_mod.call(
+                role="release_summarizer",
+                instance_id="release_summarizer_0",
+                spawned_by="orchestrator",
+                context={"inline": f"Completed actions: {', '.join(completed.keys())}"},
+                model="claude-haiku-4-5-20251001",
+            )
+            print(f"\n{summary}")
+            _clear_checkpoint()
+            log_event("run_stopped", {"pass": pass_num})
+            return
+
+        elif choice.startswith("B"):
+            print("\nWhat would you like to redirect to?")
+            work_plan_text = await _conversation_loop(config)
+            work_plan = json.loads(work_plan_text)
+
+        else:  # A — continue
+            inline = (
+                f"Pass {pass_num} complete. "
+                f"Completed action IDs: {', '.join(completed.keys())}. "
+                "Continue building — produce the next work plan."
+            )
+            result_text = await agent_mod.call(
+                role="top_level_agent",
+                instance_id=f"top_level_agent_{pass_num + 1}",
+                spawned_by="orchestrator",
+                context={"inline": inline},
+                model="claude-opus-4-7",
+            )
+            try:
+                work_plan = json.loads(result_text.strip())
+            except json.JSONDecodeError:
+                print(f"\nExpected work plan from top_level_agent but got:\n{result_text}")
+                work_plan_text = await _conversation_loop(config)
+                work_plan = json.loads(work_plan_text)
+
+        _save_checkpoint(work_plan, pass_num + 1)
+
+    print(f"\nReached maximum of {max_passes} passes.")
+    log_event("max_passes_reached", {"max_passes": max_passes})
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
 async def _main() -> None:
     load_dotenv()
     _require_env("ANTHROPIC_API_KEY")
@@ -151,24 +388,21 @@ async def _main() -> None:
     config = _load_config()
 
     # ── Resume from checkpoint if present ────────────────────────────────
+    repo = config.get("github", {}).get("repo", "")
+    if repo:
+        git_ops.configure_remote_auth(repo)
+
     saved = _load_checkpoint()
     if saved:
+        saved_plan, saved_pass = saved
         print(f"\nResuming from checkpoint: {_CHECKPOINT_PATH}")
-        print(f"  {len(saved.get('actions', []))} actions in work plan")
+        print(f"  Pass {saved_pass}, {len(saved_plan.get('actions', []))} actions in work plan")
         raw = input("Continue? [y/N] ").strip().lower()
         if raw != "y":
             _clear_checkpoint()
             print("Checkpoint cleared. Starting fresh.")
         else:
-            work_plan = saved
-            try:
-                completed = await work_plan_mod.execute(work_plan)
-                log_event("run_complete", {"completed_actions": len(completed)})
-                _clear_checkpoint()
-                print("\nRun complete.")
-            except BudgetHaltedError:
-                _save_checkpoint(work_plan)
-                print("\nRun halted by budget. Checkpoint saved.")
+            await _pass_loop(saved_plan, config, start_pass=saved_pass)
             return
 
     # ── First-run setup ──────────────────────────────────────────────────
@@ -187,7 +421,7 @@ async def _main() -> None:
         print(f"Budget set to ${total:.2f}")
         log_event("budget_set", {"total": total})
 
-    # ── Conversation → work plan ─────────────────────────────────────────
+    # ── Conversation → first work plan ───────────────────────────────────
     work_plan_text = await _conversation_loop(config)
 
     try:
@@ -198,16 +432,8 @@ async def _main() -> None:
 
     _save_checkpoint(work_plan)
 
-    # ── Execute ──────────────────────────────────────────────────────────
-    try:
-        completed = await work_plan_mod.execute(work_plan)
-        log_event("run_complete", {"completed_actions": len(completed)})
-        _clear_checkpoint()
-        print(f"\nRun complete. {len(completed)} actions executed.")
-    except BudgetHaltedError:
-        print("\nRun halted by budget. Checkpoint saved — rerun to continue.")
-    except KeyboardInterrupt:
-        print("\nInterrupted. Checkpoint saved.")
+    # ── Pass loop ─────────────────────────────────────────────────────────
+    await _pass_loop(work_plan, config, start_pass=1)
 
 
 def main() -> None:

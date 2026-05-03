@@ -68,11 +68,25 @@ class GitHubClient:
 
     # ── Issues ─────────────────────────────────────────────────────────────
 
-    def create_issue(self, title: str, body: str, labels: list[str] | None = None) -> int:
+    def create_milestone(self, title: str, description: str = "") -> int:
+        self._call("create_milestone")
+        milestone = self._repo.create_milestone(title=title, description=description)
+        log_event("github_milestone_created", {"number": milestone.number, "title": title})
+        return milestone.number
+
+    def create_issue(
+        self,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        milestone_number: int | None = None,
+    ) -> int:
         self._call("create_issue")
         kwargs: dict = {"title": title, "body": body}
         if labels:
             kwargs["labels"] = labels
+        if milestone_number is not None:
+            kwargs["milestone"] = self._repo.get_milestone(milestone_number)
         issue = self._repo.create_issue(**kwargs)
         log_event("github_issue_created", {"number": issue.number, "title": title})
         return issue.number

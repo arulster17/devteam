@@ -69,7 +69,7 @@ Return a single JSON work plan. No text before or after it.
         "documents": ["decisions/spec.md"],
         "inline": "Focus on the auth module only. Do not write tests for tasks."
       },
-      "model": "claude-haiku-4-5"
+      "model": "claude-haiku-4-5-20251001"
     },
     {
       "action": "spawn",

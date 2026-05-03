@@ -6,7 +6,12 @@
       "Bash(python -c \"from orchestrator.main import main; print\\('main OK'\\)\")",
       "Bash(python -c \"from orchestrator.github_client import GitHubClient; print\\('github_client OK'\\)\")",
       "Bash(python -c \"from orchestrator.docker_runner import DockerRunner, extract_failures; print\\('docker_runner OK'\\)\")",
-      "Bash(pip install *)"
+      "Bash(pip install *)",
+      "Bash(python -m pytest -v)",
+      "Bash(python -m mypy orchestrator/ --ignore-missing-imports)",
+      "Bash(python -m ruff check .)",
+      "Bash(python -m pytest -q)",
+      "Bash(python -m pytest tests/test_smoke.py tests/test_main_pass_loop.py -v)"
     ]
   }
 }
