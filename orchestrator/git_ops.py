@@ -23,8 +23,8 @@ def _run_lax(cmd: list[str]) -> str:
 
 def init() -> None:
     _run(["git", "init"])
-    _run(["git", "config", "user.email", "devteam-bot@localhost"])
-    _run(["git", "config", "user.name", "devteam-bot"])
+    _run(["git", "config", "user.email", "arul-devteam-bot@users.noreply.github.com"])
+    _run(["git", "config", "user.name", "arul-devteam-bot"])
 
 
 def current_commit_hash() -> str:
