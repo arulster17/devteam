@@ -64,8 +64,10 @@ async def execute(work_plan: dict, spawned_by: str = "orchestrator") -> dict[str
                 _run_agent_action(aid, action, completed, spawned_by, semaphore)
                 for aid, action in agent_actions
             ])
-            for (aid, _), result in zip(agent_actions, results):
+            for (aid, action), result in zip(agent_actions, results):
                 completed[aid] = result
+                _maybe_write_file(aid, result)
+                _maybe_post_review(aid, action, result)
                 _check_budget()
 
         for aid, action in checkpoints:
@@ -109,6 +111,68 @@ async def _run_agent_action(
             worker_results=worker_results,
         )
         return result
+
+
+def _maybe_post_review(aid: str, action: dict, result_text: str) -> None:
+    """
+    Reviewers post to GitHub immediately on completion — they don't wait for the
+    qa_manager aggregate. Silently skips if GITHUB_TOKEN is absent or the result
+    isn't reviewer JSON.
+    """
+    if action.get("role") != "reviewer":
+        return
+    try:
+        data = json.loads(result_text)
+    except (json.JSONDecodeError, ValueError):
+        return
+    verdict = data.get("verdict", "comment")
+    issues = data.get("issues", [])
+    body = "\n\n".join(
+        f"**{i.get('severity', 'minor').upper()}** `{i.get('file', '')}` "
+        f"(line {i.get('line', '?')}): {i.get('description', '')}"
+        + (f"\n> Suggestion: {i['suggestion']}" if i.get("suggestion") else "")
+        for i in issues
+    ) or "No issues found."
+
+    pr_number = _load_config().get("github", {}).get("current_pr_number")
+    if not pr_number:
+        log_event("reviewer_no_pr", {"aid": aid})
+        return
+
+    try:
+        from orchestrator.github_client import GitHubClient
+        gh = GitHubClient()
+        gh.post_pr_review(
+            pr_number=int(pr_number),
+            verdict=verdict,
+            body=body,
+            reviewer_id=aid,
+        )
+    except Exception as exc:
+        log_event("reviewer_post_error", {"aid": aid, "error": str(exc)})
+
+
+def _maybe_write_file(aid: str, result_text: str) -> None:
+    """
+    No-tool agents (pm, architect, budget_manager, release_summarizer) return:
+      {"file": "decisions/spec.md", "content": "..."}
+    Write the file to disk so downstream agents can read it from documents[].
+    Silently skips if the result isn't that shape.
+    """
+    try:
+        data = json.loads(result_text)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    file_path = data.get("file")
+    content = data.get("content")
+    if not file_path or content is None:
+        return
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    log_event("file_written", {"aid": aid, "path": file_path})
 
 
 def _check_budget() -> None:

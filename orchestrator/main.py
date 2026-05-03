@@ -30,9 +30,75 @@ _CHECKPOINT_PATH = Path("run/checkpoint.json")
 _BRIEF_PATH = Path("decisions/brief.md")
 
 
+_DEFAULT_CONFIG = {
+    "limits": {
+        "max_parallel_workers": 5,
+        "max_debug_iterations": 3,
+        "max_review_iterations": 3,
+        "max_total_passes": 10,
+        "github_poll_interval_seconds": 15,
+        "max_github_calls_per_run": 500,
+    },
+    "checkpoints": {
+        "require_approval_after_spec": True,
+        "require_approval_after_architecture": True,
+        "require_approval_after_budget": True,
+        "warn_at_budget_percent": 90,
+    },
+    "github": {
+        "repo": "",
+        "integration_branch": "integration",
+        "main_branch": "main",
+        "protect_main": True,
+    },
+    "stack": {
+        "language": "typescript",
+        "test_runner": "jest",
+        "linter": "eslint",
+        "formatter": "prettier",
+        "type_checker": "tsc",
+    },
+}
+
+
 def _load_config() -> dict:
     path = Path("config.json")
     return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _init_project_config() -> dict:
+    """
+    Create config.json in the CWD if it doesn't exist.
+    Prompts for the GitHub repo and stack language — the two things that
+    vary per project. Everything else gets sensible defaults.
+    """
+    path = Path("config.json")
+    if path.exists():
+        return json.loads(path.read_text())
+
+    print("\nNo config.json found. Initialising new project.")
+
+    repo = input("GitHub repo (owner/repo-name), or press Enter to skip: ").strip()
+
+    print("Stack language? [typescript/python/go] (default: typescript): ", end="")
+    lang = input().strip().lower() or "typescript"
+
+    runner_map = {"typescript": "jest", "python": "pytest", "go": "go test"}
+    checker_map = {"typescript": "tsc", "python": "mypy", "go": ""}
+    linter_map = {"typescript": "eslint", "python": "ruff", "go": "golangci-lint"}
+
+    config = json.loads(json.dumps(_DEFAULT_CONFIG))  # deep copy
+    config["github"]["repo"] = repo
+    config["stack"]["language"] = lang
+    config["stack"]["test_runner"] = runner_map.get(lang, "jest")
+    config["stack"]["linter"] = linter_map.get(lang, "eslint")
+    config["stack"]["type_checker"] = checker_map.get(lang, "tsc")
+    if not config["stack"]["type_checker"]:
+        del config["stack"]["type_checker"]
+
+    path.write_text(json.dumps(config, indent=2))
+    print("Created config.json — edit it any time to change settings.\n")
+    return config
 
 
 def _require_env(key: str) -> str:
@@ -271,20 +337,27 @@ def _run_github_wiring(work_plan: dict, completed: dict, pass_num: int) -> None:
     except Exception as exc:
         log_event("github_wiring_error", {"step": "dev_worker", "error": str(exc)})
 
-    # integrator → open integration → main PR
+    # integrator → open integration → main PR; write PR number to config for reviewers
     try:
         integration_branch = config.get("github", {}).get("integration_branch", "integration")
         main_branch = config.get("github", {}).get("main_branch", "main")
         for aid, action in actions_by_id.items():
             if action.get("role") == "integrator" and aid in completed:
-                if gh.branch_exists(integration_branch):
-                    pr_num = gh.create_pr(
-                        title=f"Integration pass {pass_num}",
-                        body=f"Automated integration PR for pass {pass_num}.",
-                        head=integration_branch,
-                        base=main_branch,
-                    )
-                    log_event("github_integration_pr", {"pr": pr_num, "pass": pass_num})
+                if not gh.branch_exists(integration_branch):
+                    gh.create_branch(integration_branch, from_branch=main_branch)
+                pr_num = gh.create_pr(
+                    title=f"Integration pass {pass_num}",
+                    body=f"Automated integration PR for pass {pass_num}.",
+                    head=integration_branch,
+                    base=main_branch,
+                )
+                log_event("github_integration_pr", {"pr": pr_num, "pass": pass_num})
+                # Write PR number so work_plan.py can post reviewer results to it
+                cfg_path = Path("config.json")
+                if cfg_path.exists():
+                    cfg = json.loads(cfg_path.read_text())
+                    cfg.setdefault("github", {})["current_pr_number"] = pr_num
+                    cfg_path.write_text(json.dumps(cfg, indent=2))
                 break
     except Exception as exc:
         log_event("github_wiring_error", {"step": "integrator", "error": str(exc)})
@@ -385,7 +458,7 @@ async def _main() -> None:
     load_dotenv()
     _require_env("ANTHROPIC_API_KEY")
 
-    config = _load_config()
+    config = _init_project_config()
 
     # ── Resume from checkpoint if present ────────────────────────────────
     repo = config.get("github", {}).get("repo", "")
@@ -406,6 +479,9 @@ async def _main() -> None:
             return
 
     # ── First-run setup ──────────────────────────────────────────────────
+    if not Path(".git").exists():
+        git_ops.init()
+
     if not Path(".gitignore").exists():
         git_ops.write_gitignore()
 

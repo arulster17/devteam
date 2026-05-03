@@ -1,5 +1,6 @@
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from orchestrator.context import (
     assemble_api_call,
@@ -7,7 +8,6 @@ from orchestrator.context import (
     load_prompt_file,
     resolve_documents,
 )
-
 
 # ---------------------------------------------------------------------------
 # Cache layout — assemble_api_call

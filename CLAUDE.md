@@ -11,17 +11,17 @@ The orchestrator is written in **Python**. Projects it generates should use what
 ## Commands
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Install (run once from devteam/)
+pip install -e .
 
-# Run the orchestrator
-python -m orchestrator
+# Start a new project (run from any empty project directory)
+python -m orchestrator        # or: devteam
 
 # Run tests
 pytest
 
 # Run a single test
-pytest tests/test_orchestrator.py::test_budget_tracking
+pytest tests/test_budget.py::test_record_call_calculates_cost_correctly
 
 # Lint
 ruff check .
@@ -34,17 +34,25 @@ mypy orchestrator/
 
 ```
 orchestrator/         # Python orchestrator (the non-agent core)
-  main.py             # Entry point — runs the main loop (Section 8 of spec)
+  __main__.py         # python -m orchestrator entry point
+  main.py             # Bootstrap, conversation loop, pass loop
+  agent.py            # Anthropic API caller with tool-use loop
+  work_plan.py        # Parallel work plan executor
+  context.py          # Prompt assembly and cache layout
   budget.py           # Budget tracking and enforcement
   github_client.py    # All GitHub API calls live here
-  docker_runner.py    # Docker test execution
-  logger.py           # append-only log.jsonl writer
+  docker_runner.py    # Docker sandbox test execution
+  git_ops.py          # All git subprocess calls live here
+  logger.py           # Append-only log.jsonl writer
   checkpoint.py       # Checkpoint formatting and human I/O
-prompts/              # Agent system prompts as markdown files (one per role)
-run/                  # Runtime state — log.jsonl, budget.json, checkpoint.json
-config.json           # Tunable parameters (limits, checkpoints, github, stack)
+prompts/              # Agent system prompts (one per role, loaded from package location)
+docker/               # Dockerfile templates per stack (node.dockerfile, python.dockerfile)
+tests/                # pytest test suite
+pyproject.toml        # Package definition and tooling config
 .env                  # Secrets — never committed, .gitignore written first
 ```
+
+Each project the orchestrator works on gets its own directory with its own `config.json`, `run/`, and `decisions/`. The `devteam` repo is the tool, not the workspace — run `python -m orchestrator` from the project directory, not from here.
 
 ## Core Architecture
 
@@ -246,11 +254,6 @@ Agents never run git. The orchestrator commits after each tier. Agents that prod
 - **Reviewer**: returns `{"verdict": "approve|request_changes|comment", "issues": [...]}` — orchestrator posts as GitHub PR review
 - **Manager agents**: return work plan JSON
 - **top_level_agent**: returns work plan JSON (orchestration mode) or plain text (conversation mode)
-
-## What Isn't Built Yet
-
-- Docker base images per stack
-- The orchestrator itself — the Python code implementing the main loop
 
 ## Explicitly Rejected Decisions
 

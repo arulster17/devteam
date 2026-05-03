@@ -1,12 +1,12 @@
 import asyncio
 import json
-import pytest
 from unittest.mock import AsyncMock
 
-from orchestrator.main import _pass_loop
-from orchestrator.budget import BudgetState
-from orchestrator.work_plan import BudgetHaltedError
+import pytest
 
+from orchestrator.budget import BudgetState
+from orchestrator.main import _pass_loop
+from orchestrator.work_plan import BudgetHaltedError
 
 _EMPTY_PLAN = {"type": "work_plan", "actions": []}
 _OK_STATE = BudgetState(total=100.0, spent=10.0, status="ok", calls=[])

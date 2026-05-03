@@ -10,9 +10,9 @@ import re
 import tempfile
 from pathlib import Path
 
-import docker  # type: ignore[import-not-found,attr-defined]
-from docker.errors import ContainerError, ImageNotFound, APIError  # type: ignore[import-not-found]
+from docker.errors import APIError, ContainerError, ImageNotFound  # type: ignore[import-not-found]
 
+import docker  # type: ignore[import-not-found,attr-defined]
 from orchestrator.logger import log_event
 
 # Per-container resource limits from the spec
@@ -27,12 +27,15 @@ def _load_stack() -> dict:
     return {}
 
 
+_DOCKER_DIR = Path(__file__).parent.parent / "docker"
+
+
 def _runner_image(stack: dict) -> tuple[str, Path | None]:
     """Map language/test_runner to (image_tag, dockerfile_path|None)."""
     language = stack.get("language", "typescript").lower()
     test_runner = stack.get("test_runner", "jest").lower()
-    _NODE = ("devteam-node:latest", Path("docker/node.dockerfile"))
-    _PYTHON = ("devteam-python:latest", Path("docker/python.dockerfile"))
+    _NODE = ("devteam-node:latest", _DOCKER_DIR / "node.dockerfile")
+    _PYTHON = ("devteam-python:latest", _DOCKER_DIR / "python.dockerfile")
     configs: dict[tuple[str, str], tuple[str, Path | None]] = {
         ("typescript", "jest"): _NODE,
         ("javascript", "jest"): _NODE,
@@ -272,7 +275,10 @@ def extract_failures(output: str, test_runner: str = "jest") -> list[dict]:
         # Extract failure blocks between ● markers
         blocks = suite_pattern.findall(output)
         # Also grab the "Expected / Received" lines from the output
-        error_lines = [line.strip() for line in output.splitlines() if line.strip().startswith("Expected") or line.strip().startswith("Received")]
+        error_lines = [
+            line.strip() for line in output.splitlines()
+            if line.strip().startswith("Expected") or line.strip().startswith("Received")
+        ]
         for i, block in enumerate(blocks):
             message = error_lines[i] if i < len(error_lines) else ""
             failures.append({"test": block.strip(), "message": message})

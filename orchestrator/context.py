@@ -1,6 +1,8 @@
 from pathlib import Path
 
-PROMPTS_DIR = Path("prompts")
+# Prompts live next to the orchestrator package, not in the project CWD.
+# This lets `python -m orchestrator` run from any project directory.
+PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
 def load_prompt_file(role: str) -> str:

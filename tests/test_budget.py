@@ -7,7 +7,7 @@ Uses a tmp_path fixture so tests never touch run/budget.json.
 import pytest
 
 from orchestrator import budget as budget_mod
-from orchestrator.budget import BudgetState, PRICING
+from orchestrator.budget import PRICING, BudgetState
 
 
 class _Usage:

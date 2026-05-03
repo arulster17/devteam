@@ -21,6 +21,12 @@ def _run_lax(cmd: list[str]) -> str:
     return result.stdout.strip()
 
 
+def init() -> None:
+    _run(["git", "init"])
+    _run(["git", "config", "user.email", "devteam-bot@localhost"])
+    _run(["git", "config", "user.name", "devteam-bot"])
+
+
 def current_commit_hash() -> str:
     return _run(["git", "rev-parse", "HEAD"])
 
@@ -48,15 +54,22 @@ def push(branch: str, remote: str = "origin") -> None:
 
 def configure_remote_auth(repo: str, remote: str = "origin") -> None:
     """
-    Set the remote URL to use the GITHUB_TOKEN for HTTPS auth.
-    Call once on startup if GITHUB_TOKEN is set.
+    Point the git remote at the GitHub repo using GITHUB_TOKEN for HTTPS auth.
+    Creates the remote if it doesn't exist; updates the URL if it does.
     repo format: "owner/repo-name"
     """
     token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
+    if not token or not repo:
         return
     url = f"https://x-access-token:{token}@github.com/{repo}.git"
-    _run(["git", "remote", "set-url", remote, url])
+    result = subprocess.run(
+        ["git", "remote", "get-url", remote],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        _run(["git", "remote", "set-url", remote, url])
+    else:
+        _run(["git", "remote", "add", remote, url])
 
 
 def write_gitignore() -> None:

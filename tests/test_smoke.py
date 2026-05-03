@@ -7,11 +7,11 @@ or filesystem writes outside tmp_path.
 """
 import asyncio
 import json
-import pytest
 from unittest.mock import AsyncMock
 
-from orchestrator.main import _main
+import pytest
 
+from orchestrator.main import _main
 
 _WORK_PLAN = {
     "type": "work_plan",
@@ -44,9 +44,9 @@ _RELEASE_SUMMARY = json.dumps({
 @pytest.fixture()
 def tmp_run(tmp_path, monkeypatch):
     """Redirect all file I/O to tmp_path so tests are hermetic."""
-    import orchestrator.main as main_mod
     import orchestrator.budget as budget_mod
     import orchestrator.logger as logger_mod
+    import orchestrator.main as main_mod
 
     monkeypatch.setattr(main_mod, "_CHECKPOINT_PATH", tmp_path / "checkpoint.json")
     monkeypatch.setattr(budget_mod, "BUDGET_PATH", tmp_path / "budget.json")
@@ -136,8 +136,8 @@ def test_smoke_resume_from_checkpoint(tmp_run, mock_env, mock_git, monkeypatch, 
     Checkpoint exists → user confirms → resumes into _pass_loop at saved pass.
     Verifies: budget_manager and conversation loop are NOT re-run.
     """
-    import orchestrator.main as main_mod
     import orchestrator.budget as budget_mod
+    import orchestrator.main as main_mod
     import orchestrator.work_plan as wp_mod
 
     # Pre-write a checkpoint at pass 2
@@ -181,8 +181,8 @@ def test_smoke_checkpoint_pass_number_preserved(tmp_run, mock_env, mock_git, mon
     After a budget halt on pass 3, checkpoint records pass_num=3.
     On resume, _pass_loop starts at pass 3, not pass 1.
     """
-    import orchestrator.main as main_mod
     import orchestrator.budget as budget_mod
+    import orchestrator.main as main_mod
     import orchestrator.work_plan as wp_mod
     from orchestrator.work_plan import BudgetHaltedError
 

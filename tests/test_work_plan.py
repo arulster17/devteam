@@ -1,10 +1,10 @@
 import asyncio
-import pytest
 from unittest.mock import AsyncMock, patch
 
-from orchestrator.work_plan import execute, BudgetHaltedError
-from orchestrator.budget import BudgetState
+import pytest
 
+from orchestrator.budget import BudgetState
+from orchestrator.work_plan import BudgetHaltedError, execute
 
 _STATE_OK = BudgetState(total=100.0, spent=10.0, status="ok", calls=[])
 _STATE_HALTED = BudgetState(total=100.0, spent=110.0, status="halted", calls=[])
@@ -244,3 +244,54 @@ def test_unsatisfiable_deps_returns_partial(ok_budget):
 
     assert "w1" in result
     assert "w2" not in result
+
+
+# ---------------------------------------------------------------------------
+# _maybe_write_file — no-tool agent file output
+# ---------------------------------------------------------------------------
+
+def test_file_output_written_to_disk(ok_budget, tmp_path, monkeypatch):
+    """pm/architect return {"file": "...", "content": "..."} — orchestrator writes it."""
+    monkeypatch.chdir(tmp_path)
+
+    file_result = '{"file": "decisions/spec.md", "content": "# Spec\\nHello"}'
+
+    with patch("orchestrator.work_plan.agent_mod.call", new_callable=AsyncMock) as m:
+        m.return_value = file_result
+        asyncio.run(execute({"actions": [_SPAWN("pm_0", [])]}))
+
+    written = (tmp_path / "decisions" / "spec.md").read_text()
+    assert written == "# Spec\nHello"
+
+
+def test_file_output_creates_parent_dirs(ok_budget, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    nested = '{"file": "decisions/sub/arch.md", "content": "deep"}'
+
+    with patch("orchestrator.work_plan.agent_mod.call", new_callable=AsyncMock) as m:
+        m.return_value = nested
+        asyncio.run(execute({"actions": [_SPAWN("arch_0", [])]}))
+
+    assert (tmp_path / "decisions" / "sub" / "arch.md").read_text() == "deep"
+
+
+def test_non_file_result_not_written(ok_budget, tmp_path, monkeypatch):
+    """Plain text or status JSON doesn't trigger file writes."""
+    monkeypatch.chdir(tmp_path)
+
+    with patch("orchestrator.work_plan.agent_mod.call", new_callable=AsyncMock) as m:
+        m.return_value = '{"status": "complete", "files_written": ["src/auth.ts"]}'
+        asyncio.run(execute({"actions": [_SPAWN("dev_0", [])]}))
+
+    # No file should have been created (decisions/ doesn't exist)
+    assert not (tmp_path / "decisions").exists()
+
+
+def test_plain_text_result_not_written(ok_budget, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    with patch("orchestrator.work_plan.agent_mod.call", new_callable=AsyncMock) as m:
+        m.return_value = "plain text response"
+        asyncio.run(execute({"actions": [_SPAWN("w1", [])]}))
+
+    assert list(tmp_path.iterdir()) == []
